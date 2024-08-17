@@ -10,45 +10,48 @@
 using namespace std;
 
 
-struct MallocMetadata {
+struct Block_Node {
     size_t canary; //Where should the canary be placed in the metadata?
     bool is_free;
     size_t size;//actual size of the whole block minus the metadata
-    MallocMetadata* next;
-    MallocMetadata* prev;
+    Block_Node* next;
+    Block_Node* prev;
 };
-
+Block_Node* try_expand_block(Block_Node* block, size_t target_size);
+void* allocate_and_copy(void* oldp, Block_Node* old_block, size_t new_size);
+void* handle_large_realloc(void* oldp, Block_Node* block, size_t size);
+void adjust_block_after_expansion(Block_Node* block, size_t original_size, size_t new_size);
 //std::srand(std::time(nullptr));//not working outside a function (nizan)
 size_t ourCanary;
 const int max_order = 10;
 bool first_time = true;
-MallocMetadata* free_lists[max_order + 1];
+Block_Node* free_lists[max_order + 1];
 size_t num_free_blocks = 0;
 size_t num_free_bytes = 0;
 size_t num_allocated_blocks = 0;
 size_t num_allocated_bytes = 0;
 size_t num_meta_data_bytes = 0;
-MallocMetadata* mmap_region = nullptr;
+Block_Node* mmap_region = nullptr;
 
-MallocMetadata* find_buddy(MallocMetadata* block){
-    unsigned long address = (unsigned long)block ^ (block->size + sizeof(MallocMetadata));
-    return (MallocMetadata*)address;
+Block_Node* find_buddy(Block_Node* block){
+    unsigned long address = (unsigned long)block ^ (block->size + sizeof(Block_Node));
+    return (Block_Node*)address;
 }
 
-int find_order(MallocMetadata* block){
-    return log2((double)(block->size + sizeof(MallocMetadata))) - 7;
+int find_order(Block_Node* block){
+    return log2((double)(block->size + sizeof(Block_Node))) - 7;
 }
 
-void check_meta_data(MallocMetadata *block){
+void check_meta_data(Block_Node *block){
     if(block->canary != ourCanary){ // if the canary is not equal to our canary
         exit(0xdeadbeef);
     }
 }
 
 
-void remove_block_from_free_list(MallocMetadata* block){
+void remove_block_from_free_list(Block_Node* block){
     check_meta_data(block);
-    MallocMetadata* first = free_lists[find_order(block)], *curr = first;
+    Block_Node* first = free_lists[find_order(block)], *curr = first;
     if(first == nullptr){
         return;
     }
@@ -75,99 +78,108 @@ void remove_block_from_free_list(MallocMetadata* block){
     block->prev = nullptr;
 }
 
-
-void enter_block_into_free_list(MallocMetadata* new_block){
+void enter_block_into_free_list(Block_Node* new_block) {
     int order = find_order(new_block);
     new_block->canary = ourCanary;
-    MallocMetadata* first = free_lists[order];
-    MallocMetadata* current = first;
-    /////////
-    //TESTS: wrote this again, old one not good, switch
-    current = first;
-    if (first == nullptr) {
-        free_lists[order] = new_block;
-    }
+    Block_Node*& first = free_lists[order];
 
-        // If the new node should be inserted at the beginning
-    else if (new_block < first) {
+    // Use binary search to find insertion point
+    if (first == nullptr || new_block < first) {
         new_block->next = first;
-        first->prev = new_block;
         new_block->prev = nullptr;
-        free_lists[order] = new_block;
+        if (first) first->prev = new_block;
+        first = new_block;
+        return;
     }
 
-    else {
-        // Find the correct position to insert the new node
-        while (current->next != nullptr && current->next < new_block) {
-            current = current->next;
+    Block_Node* left = first;
+    Block_Node* right = nullptr;
+    while (left->next != nullptr) {
+        if (new_block < left->next) {
+            right = left->next;
+            break;
         }
-
-        // Insert the new node
-        new_block->next = current->next;
-        new_block->prev = current;
-        if (current->next != nullptr) {
-            current->next->prev = new_block;
-        }
-        current->next = new_block;
-
+        left = left->next;
     }
-    ////////
 
+    // Insert the new node
+    new_block->next = right;
+    new_block->prev = left;
+    left->next = new_block;
+    if (right) right->prev = new_block;
 }
-
-bool try_to_merge(MallocMetadata* block, int required_order = max_order){
+bool try_to_merge(Block_Node* block, int required_order = max_order) {
     check_meta_data(block);
     int order = find_order(block);
-    if(order >= required_order){
+    if (order >= required_order) {
         return false;
     }
-    MallocMetadata* buddy = find_buddy(block);
-    if(buddy->size != block->size){
+
+    Block_Node* buddy = find_buddy(block);
+    if (buddy->size != block->size || !buddy->is_free) {
         return false;
     }
-    check_meta_data(buddy); //check if buddy is free
-    if(buddy->is_free){
-        remove_block_from_free_list(buddy);
-        remove_block_from_free_list(block); //remove block from free list
-        if(buddy < block){////latest
-            block = buddy;
-        }
-        block->size = (block->size + sizeof(MallocMetadata)) * 2 - sizeof(MallocMetadata);
-        enter_block_into_free_list(block);
-        num_free_blocks--;
-        num_free_bytes += sizeof(MallocMetadata);
-        num_allocated_blocks--;
-        num_allocated_bytes += sizeof(MallocMetadata);
-        num_meta_data_bytes -= sizeof(MallocMetadata);
-        return true;
-    }
-    return false;
+
+    check_meta_data(buddy);
+
+    // Determine which block to keep (the one with lower address)
+    Block_Node* keep_block = (buddy < block) ? buddy : block;
+    //Block_Node* remove_block = (buddy < block) ? block : buddy;
+
+    remove_block_from_free_list(buddy);
+    remove_block_from_free_list(block);
+
+    keep_block->size = (keep_block->size + sizeof(Block_Node)) * 2 - sizeof(Block_Node);
+    keep_block->is_free = true;
+
+    // Update global counters
+    num_free_blocks--;
+    num_free_bytes += sizeof(Block_Node);
+    num_allocated_blocks--;
+    num_allocated_bytes += sizeof(Block_Node);
+    num_meta_data_bytes -= sizeof(Block_Node);
+
+    // Re-insert the merged block
+    enter_block_into_free_list(keep_block);
+
+    return true;
 }
 
 
+int try_to_split(Block_Node* block_to_split, size_t requested_size) {
+    check_meta_data(block_to_split);
+    int current_order = find_order(block_to_split);
+    size_t total_size = block_to_split->size + sizeof(Block_Node);
+    size_t half_size = total_size / 2;
 
-int try_to_split(MallocMetadata* new_block, size_t requestedSize){
-    check_meta_data(new_block);
-    int order = find_order(new_block);
-    size_t size_after_split = (new_block->size + sizeof(MallocMetadata)) / 2 - sizeof(MallocMetadata);
-    if(order <= 0 || size_after_split < requestedSize){
+    if (current_order <= 0 || half_size - sizeof(Block_Node) < requested_size) {
         return -1;
     }
-    remove_block_from_free_list(new_block);//is it affecting num_free_blocks?
-    new_block->size = size_after_split;
-    MallocMetadata* buddy = find_buddy(new_block);
-    buddy->size = new_block->size;
-    buddy->is_free = true;
-    new_block->canary = ourCanary;
-    buddy->canary = ourCanary;
-    enter_block_into_free_list(buddy);
-    enter_block_into_free_list(new_block);
-    num_free_blocks += 1;
-    num_free_bytes -= sizeof(MallocMetadata);
+
+    remove_block_from_free_list(block_to_split);
+
+    // Create new buddy block
+    Block_Node* new_buddy = reinterpret_cast<Block_Node*>(
+            reinterpret_cast<char*>(block_to_split) + half_size
+    );
+
+    // Set up both blocks
+    block_to_split->size = new_buddy->size = half_size - sizeof(Block_Node);
+    block_to_split->is_free = new_buddy->is_free = true;
+    block_to_split->canary = new_buddy->canary = ourCanary;
+
+    // Insert both blocks into free list
+    enter_block_into_free_list(new_buddy);
+    enter_block_into_free_list(block_to_split);
+
+    // Update global counters
+    num_free_blocks++;
+    num_free_bytes -= sizeof(Block_Node);
     num_allocated_blocks++;
-    num_allocated_bytes -= sizeof(MallocMetadata);
-    num_meta_data_bytes += sizeof(MallocMetadata);
-    return order - 1;
+    num_allocated_bytes -= sizeof(Block_Node);
+    num_meta_data_bytes += sizeof(Block_Node);
+
+    return current_order - 1;
 }
 
 
@@ -192,20 +204,20 @@ void* initialize_stuff(){
         free_list = nullptr;
     }
 
-    auto curr = (MallocMetadata*)((char*)address + bytes_from_allignement);
+    auto curr = (Block_Node*)((char*)address + bytes_from_allignement);
     for (int i = 0; i < 32; i++) {
-        curr->size = 128 * 1024 - sizeof(MallocMetadata);
+        curr->size = 128 * 1024 - sizeof(Block_Node);
         curr->canary = ourCanary;
         curr->is_free = true;
         curr->next = nullptr;
         curr->prev = nullptr;
         enter_block_into_free_list(curr);
-        curr = (MallocMetadata*) ((char*) curr + 128 * 1024);
+        curr = (Block_Node*) ((char*) curr + 128 * 1024);
         num_free_blocks++;
-        num_free_bytes += 128 * 1024 - sizeof(MallocMetadata);
+        num_free_bytes += 128 * 1024 - sizeof(Block_Node);
         num_allocated_blocks++;
-        num_allocated_bytes += 128 * 1024 - sizeof(MallocMetadata);
-        num_meta_data_bytes += sizeof(MallocMetadata);
+        num_allocated_bytes += 128 * 1024 - sizeof(Block_Node);
+        num_meta_data_bytes += sizeof(Block_Node);
     }
     return nullptr;
 }
@@ -225,39 +237,24 @@ void* smalloc(size_t size){
     }
 
     //mmap part
-    if(size + sizeof(MallocMetadata) >= 1024 * 128){
+    if(size + sizeof(Block_Node) >= 1024 * 128){
         //use mmap
-        void* request = mmap(NULL, size + sizeof(MallocMetadata), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        void* request = mmap(NULL, size + sizeof(Block_Node), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
         if(request == (void*)(-1)){
             return nullptr;
         }
-        MallocMetadata* block = (MallocMetadata*)request;
+        Block_Node* block = (Block_Node*)request;
         block->size = size;
         block->canary = ourCanary;
         block->is_free = false;
         //add to mmap_region
-//        while(curr != nullptr && block < curr){
-//            curr = curr->next;
-//        }
-//        if(curr == nullptr){
-//            block->next = nullptr;
-//            mmap_region = block;
-//        }
-//        else{
-//            block->next = curr;
-//            block->prev = curr->prev;
-//            curr->prev->next = block;
-//            curr->prev = block;
-//        }
-//        curr->next = nullptr;
-//        curr->prev = nullptr;
         num_allocated_blocks++;
         num_allocated_bytes += size; //NOT SURE ABOUT THIS
-        num_meta_data_bytes += sizeof(MallocMetadata);
-        return (char*)(block) + (size_t)sizeof(MallocMetadata);
+        num_meta_data_bytes += sizeof(Block_Node);
+        return (char*)(block) + (size_t)sizeof(Block_Node);
     }
     //not mmap
-    MallocMetadata* curr = nullptr;
+    Block_Node* curr = nullptr;
     for (int i = 0; i < max_order + 1; ++i) {
         curr = free_lists[i];
         while(curr != nullptr){
@@ -271,9 +268,9 @@ void* smalloc(size_t size){
                     num_free_blocks--;
                     num_free_bytes -= curr->size;
                     //num_allocated_blocks++;//should be unchanged because it counts both free and allocated
-                    //num_allocated_bytes += curr->size - sizeof(MallocMetadata);//same
-                    //num_meta_data_bytes += sizeof(MallocMetadata);//same
-                    return (void*)((char*)(curr) + sizeof(MallocMetadata));
+                    //num_allocated_bytes += curr->size - sizeof(Block_Node);//same
+                    //num_meta_data_bytes += sizeof(Block_Node);//same
+                    return (void*)((char*)(curr) + sizeof(Block_Node));
                 } else{
                     curr = curr->next;
                 }
@@ -298,14 +295,14 @@ void sfree(void* p){
     if(p == nullptr){
         return;
     }
-    MallocMetadata* block = (MallocMetadata*)((char*)p - sizeof(MallocMetadata));
+    Block_Node* block = (Block_Node*)((char*)p - sizeof(Block_Node));
     if(block->is_free){
         return;
     }
     check_meta_data(block);
-    if(block->size > 128 * 1024 - sizeof(MallocMetadata)){
+    if(block->size > 128 * 1024 - sizeof(Block_Node)){
         //mmap
-//        MallocMetadata* curr = mmap_region;
+//        Block_Node* curr = mmap_region;
 //        while(curr != block){
 //            curr = curr->next;
 //        }
@@ -322,8 +319,8 @@ void sfree(void* p){
         //mmap
         num_allocated_blocks--;
         num_allocated_bytes -= block->size;
-        num_meta_data_bytes -= sizeof(MallocMetadata);
-        munmap(block, block->size + sizeof(MallocMetadata));
+        num_meta_data_bytes -= sizeof(Block_Node);
+        munmap(block, block->size + sizeof(Block_Node));
 
         //without ++ to num_free as instructed
         return;
@@ -335,7 +332,7 @@ void sfree(void* p){
     num_free_blocks++;
     num_free_bytes += block->size;
     while(try_to_merge(block)){
-        MallocMetadata* buddy = find_buddy(block);
+        Block_Node* buddy = find_buddy(block);
         if(buddy < block){
             block = buddy;
         }
@@ -347,160 +344,127 @@ void sfree(void* p){
 
 }
 
-void* srealloc(void* oldp, size_t size){
-    if(size == 0 || size > 1e8){
+void* srealloc(void* oldp, size_t size) {
+    if (size == 0 || size > 1e8) {
         return NULL;
     }
-    if(oldp == NULL){
+    if (oldp == NULL) {
         return smalloc(size);
     }
-    auto block = (MallocMetadata*)((char*) oldp - sizeof(MallocMetadata));
-    if(block->size < 128 * 1024 - sizeof(MallocMetadata)) {
-        /* Not mmap */
-        //case a- size is big enough
-        check_meta_data(block);
-        if (block->size >= size) {
-            return oldp;
-        }
-        //case b- by merging with this block we can do it
-        size_t old_size = block->size;
-        MallocMetadata* curr = block;
-        size_t last_curr_size = curr->size;
-        while (true) {
-            if (find_order(curr) >= max_order) {
-                break;
-            }
-            if (curr->size >= size) {
-                break;
-            }
-            MallocMetadata *buddy = find_buddy(curr);
-            if (find_order(block) == find_order(buddy) && buddy->is_free) {
-                if(buddy < curr){
-                    curr->size = last_curr_size;
-                    curr = buddy;
-                    last_curr_size = curr->size;
-                }
-                curr->size = (curr->size + sizeof(MallocMetadata)) * 2 - sizeof(MallocMetadata);
-            } else {
-                break;
-            }
-        }
-        if (curr->size >= size) {
-            block = curr;
-            int required_order = find_order(block);
-            block->size = old_size;
-            block->is_free = true;
-            enter_block_into_free_list(block);
 
-            num_free_blocks++;
-            num_free_bytes += block->size;
+    auto block = (Block_Node*)((char*)oldp - sizeof(Block_Node));
+    check_meta_data(block);
 
-            while(try_to_merge(block, required_order)){
-                MallocMetadata* buddy = find_buddy(block);
-                if(buddy < block){
-                    block = buddy;
-                }
-            }
-            block->is_free = false;
-            remove_block_from_free_list(block);
-
-            num_free_blocks--;
-            num_free_bytes -= block->size;//which is the new size
-
-            return (void*)((char*)(block) + sizeof(MallocMetadata));
-        }
-        curr->size = last_curr_size;
-        block->size = old_size;
+    // Handle large allocations (mmap)
+    if (block->size >= 128 * 1024 - sizeof(Block_Node)) {
+        return handle_large_realloc(oldp, block, size);
     }
-    //case c- finding another block that is big enough (same in both mmap and regular)
-    if (block->size == size){
+
+    // Case 1: Current block is big enough
+    if (block->size >= size) {
         return oldp;
     }
-    void* newp = smalloc(size);//size will fit mmap or regular matching to oldp as they said
-    if(newp == NULL){
+
+    // Case 2: Try to expand in-place by merging with buddies
+    size_t original_size = block->size;
+    Block_Node* expanded_block = try_expand_block(block, size);
+
+    if (expanded_block && expanded_block->size >= size) {
+        adjust_block_after_expansion(expanded_block, original_size, size);
+        return (void*)((char*)(expanded_block) + sizeof(Block_Node));
+    }
+
+    // Case 3: Allocate new block and copy data
+    return allocate_and_copy(oldp, block, size);
+}
+
+Block_Node* try_expand_block(Block_Node* block, size_t target_size) {
+    Block_Node* curr = block;
+    size_t current_size = curr->size;
+
+    while (find_order(curr) < max_order && current_size < target_size) {
+        Block_Node* buddy = find_buddy(curr);
+
+        // Safety checks
+        if (!buddy || buddy->size != curr->size) {
+            break;
+        }
+
+        check_meta_data(buddy);
+        if (!buddy->is_free) {
+            break;
+        }
+
+        remove_block_from_free_list(buddy);
+        current_size = (current_size + sizeof(Block_Node)) * 2 - sizeof(Block_Node);
+
+        if (buddy < curr) {
+            curr = buddy;
+        }
+        curr->size = current_size;
+    }
+    return curr;
+}
+
+void adjust_block_after_expansion(Block_Node* block, size_t original_size, size_t new_size) {
+    int required_order = find_order(block);
+    block->size = original_size;
+    block->is_free = true;
+    enter_block_into_free_list(block);
+
+    num_free_blocks++;
+    num_free_bytes += block->size;
+
+    while (try_to_merge(block, required_order)) {
+        Block_Node* buddy = find_buddy(block);
+        if (buddy && buddy < block) {
+            block = buddy;
+        }
+    }
+    block->is_free = false;
+    remove_block_from_free_list(block);
+
+    num_free_blocks--;
+    num_free_bytes -= block->size;
+}
+
+void* allocate_and_copy(void* oldp, Block_Node* old_block, size_t new_size) {
+    void* newp = smalloc(new_size);
+    if (newp == NULL) {
         return NULL;
     }
-    size_t smaller_size = (block->size < size) ? block->size : size;
-    memcpy(newp, oldp, smaller_size);
+    size_t copy_size = (old_block->size < new_size) ? old_block->size : new_size;
+    memcpy(newp, oldp, copy_size);
     sfree(oldp);
     return newp;
 }
 
+void* handle_large_realloc(void* oldp, Block_Node* block, size_t size) {
+    if (block->size >= size) {
+        return oldp;
+    }
+    return allocate_and_copy(oldp, block, size);
+}
+
 
 size_t _num_free_blocks(){
-    // Returns the number of allocated blocks in the heap that are currently free.
     return num_free_blocks;
 }
 size_t _num_free_bytes(){
-    //Returns the number of bytes in all allocated blocks in the heap that are currently free,
-    //excluding the bytes used by the meta-data structs.
+
     return num_free_bytes;
 }
 size_t _num_allocated_blocks(){
-    //Returns the overall (free and used) number of allocated blocks in the heap.
     return num_allocated_blocks;
 }
 size_t _num_allocated_bytes(){
-    //Returns the overall number (free and used) of allocated bytes in the heap, excluding
-    //the bytes used by the meta-data structs
+
     return num_allocated_bytes;
 }
 size_t _num_meta_data_bytes(){
-    //Returns the overall number of meta-data bytes currently in the heap.
     return num_meta_data_bytes;
 }
 size_t _size_meta_data(){
-    //Returns the number of bytes of a single meta-data structure in your system.
-    return sizeof(MallocMetadata);
-}
-
-void print_stats(){
-    printf("num_free_blocks: %zu\n", _num_free_blocks());
-    printf("num_free_bytes: %zu\n", _num_free_bytes());
-    printf("num_allocated_blocks: %zu\n", _num_allocated_blocks());
-    printf("num_allocated_bytes: %zu\n", _num_allocated_bytes());
-    printf("num_meta_data_bytes: %zu\n", _num_meta_data_bytes());
-    printf("size_meta_data: %zu\n", _size_meta_data());
+    return sizeof(Block_Node);
 }
 #define MAX_ELEMENT_SIZE (128*1024)
-//int main(int argc, char** argv){
-//    // Allocate and initialize memory with zeros
-//    smalloc(0);
-//    printf("ran smalloc(0)\n");
-//    print_stats();
-//    printf("\n");
-//
-//    void* block1 = smalloc(50);
-//    printf("ran smalloc(50)\n");
-//    print_stats();
-//    printf("\n");
-//
-//    void* block2 = smalloc(50);
-//    printf("ran smalloc(50)\n");
-//    print_stats();
-//    printf("\n");
-//
-//    block1 = srealloc(block1, 1000);
-//    printf("ran srealloc(1000))\n");
-//    print_stats();
-//    printf("\n");
-//
-//    block2 = srealloc(block2, 3000);
-//    printf("ran srealloc(3000))\n");
-//    print_stats();
-//    printf("\n");
-//
-//
-//    sfree(block1);
-//    printf("ran free(block1)\n");
-//    print_stats();
-//    printf("\n");
-//
-//    sfree(block2);
-//    printf("ran free(block2)\n");
-//    print_stats();
-//    printf("\n");
-//
-//
-//return 0;
-//}
