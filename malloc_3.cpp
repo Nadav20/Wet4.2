@@ -24,7 +24,7 @@ void adjust_block_after_expansion(Block_Node* block, size_t original_size, size_
 //std::srand(std::time(nullptr));//not working outside a function (nizan)
 size_t ourCanary;
 const int max_order = 10;
-bool first_time = true;
+int num_of_times_malloc_called = 0;
 Block_Node* free_lists[max_order + 1];
 size_t num_free_blocks = 0;
 size_t num_free_bytes = 0;
@@ -225,8 +225,8 @@ void* initialize_stuff(){
 
 void* smalloc(size_t size){
     //gets the size from the user-so the exact size the user wanted without extra stuff
-    if(first_time){
-        first_time = false;
+    if(num_of_times_malloc_called == 0){
+        num_of_times_malloc_called = 2;
         if(initialize_stuff() == (void*)(-1)){
             return nullptr;
         }
@@ -267,9 +267,6 @@ void* smalloc(size_t size){
                     remove_block_from_free_list(curr);//IS IT NEEDED?
                     num_free_blocks--;
                     num_free_bytes -= curr->size;
-                    //num_allocated_blocks++;//should be unchanged because it counts both free and allocated
-                    //num_allocated_bytes += curr->size - sizeof(Block_Node);//same
-                    //num_meta_data_bytes += sizeof(Block_Node);//same
                     return (void*)((char*)(curr) + sizeof(Block_Node));
                 } else{
                     curr = curr->next;
@@ -301,21 +298,6 @@ void sfree(void* p){
     }
     check_meta_data(block);
     if(block->size > 128 * 1024 - sizeof(Block_Node)){
-        //mmap
-//        Block_Node* curr = mmap_region;
-//        while(curr != block){
-//            curr = curr->next;
-//        }
-//        if(curr == mmap_region){
-//            mmap_region = mmap_region->next;
-//        }
-//        else{
-//            curr->prev->next = curr->next;
-//            if(curr->next != nullptr){
-//                curr->next->prev = curr->prev;
-//            }
-//        }
-
         //mmap
         num_allocated_blocks--;
         num_allocated_bytes -= block->size;
